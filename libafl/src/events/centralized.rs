@@ -10,8 +10,6 @@
 use alloc::{boxed::Box, string::String, vec::Vec};
 use core::{marker::PhantomData, num::NonZeroUsize, time::Duration};
 
-#[cfg(feature = "adaptive_serialization")]
-use libafl_bolts::current_time;
 #[cfg(feature = "llmp_compression")]
 use libafl_bolts::{
     compress::GzipCompressor,
@@ -24,22 +22,22 @@ use libafl_bolts::{
 };
 use serde::{Deserialize, Serialize};
 
-use super::{CustomBufEventResult, HasCustomBufHandlers, ProgressReporter};
 #[cfg(feature = "llmp_compression")]
 use crate::events::llmp::COMPRESS_THRESHOLD;
 #[cfg(feature = "scalability_introspection")]
 use crate::state::HasScalabilityMonitor;
 use crate::{
     events::{
-        llmp::EventStatsCollector, BrokerEventResult, Event, EventConfig, EventFirer, EventManager,
-        EventManagerId, EventProcessor, EventRestarter, HasEventManagerId, LogSeverity,
+        AdaptiveSerializer, BrokerEventResult, CustomBufEventResult, Event, EventConfig,
+        EventFirer, EventManager, EventManagerId, EventProcessor, EventRestarter,
+        HasCustomBufHandlers, HasEventManagerId, LogSeverity, ProgressReporter,
     },
     executors::{Executor, HasObservers},
     fuzzer::{EvaluatorObservers, ExecutionProcessor},
     inputs::{Input, UsesInput},
     observers::ObserversTuple,
-    state::{HasExecutions, HasLastReportTime, HasMetadata, UsesState},
-    Error,
+    state::{HasExecutions, HasLastReportTime, UsesState},
+    Error, HasMetadata,
 };
 
 const _LLMP_TAG_TO_MAIN: Tag = Tag(0x3453453);
@@ -93,15 +91,10 @@ where
     ///
     /// The port must not be bound yet to have a broker.
     #[cfg(feature = "std")]
-    pub fn on_port(shmem_provider: SP, port: u16, client_timeout: Duration) -> Result<Self, Error> {
+    pub fn on_port(shmem_provider: SP, port: u16) -> Result<Self, Error> {
         Ok(Self {
             // TODO switch to false after solving the bug
-            llmp: LlmpBroker::with_keep_pages_attach_to_tcp(
-                shmem_provider,
-                port,
-                true,
-                client_timeout,
-            )?,
+            llmp: LlmpBroker::with_keep_pages_attach_to_tcp(shmem_provider, port, true)?,
             #[cfg(feature = "llmp_compression")]
             compressor: GzipCompressor::new(COMPRESS_THRESHOLD),
             phantom: PhantomData,
@@ -240,9 +233,9 @@ where
 }
 
 #[cfg(feature = "adaptive_serialization")]
-impl<EM, SP> EventStatsCollector for CentralizedEventManager<EM, SP>
+impl<EM, SP> AdaptiveSerializer for CentralizedEventManager<EM, SP>
 where
-    EM: EventStatsCollector + UsesState,
+    EM: AdaptiveSerializer + UsesState,
     SP: ShMemProvider + 'static,
 {
     fn serialization_time(&self) -> Duration {
@@ -273,16 +266,16 @@ where
 }
 
 #[cfg(not(feature = "adaptive_serialization"))]
-impl<EM, SP> EventStatsCollector for CentralizedEventManager<EM, SP>
+impl<EM, SP> AdaptiveSerializer for CentralizedEventManager<EM, SP>
 where
-    EM: EventStatsCollector + UsesState,
+    EM: AdaptiveSerializer + UsesState,
     SP: ShMemProvider + 'static,
 {
 }
 
 impl<EM, SP> EventFirer for CentralizedEventManager<EM, SP>
 where
-    EM: EventStatsCollector + EventFirer + HasEventManagerId,
+    EM: AdaptiveSerializer + EventFirer + HasEventManagerId + AdaptiveSerializer,
     SP: ShMemProvider + 'static,
 {
     fn fire(
@@ -292,6 +285,7 @@ where
     ) -> Result<(), Error> {
         if !self.is_main {
             // secondary node
+            let mut is_tc = false;
             let is_nt_or_heartbeat = match &mut event {
                 Event::NewTestcase {
                     input: _,
@@ -304,19 +298,26 @@ where
                     forward_id,
                 } => {
                     *forward_id = Some(ClientId(self.inner.mgr_id().0 as u32));
+                    is_tc = true;
                     true
                 }
                 Event::UpdateExecStats {
                     time: _,
                     executions: _,
                     phantom: _,
-                } => true,
+                } => true, // send it but this guy won't be handled. the only purpose is to keep this client alive else the broker thinks it is dead and will dc it
                 _ => false,
             };
+
             if is_nt_or_heartbeat {
-                return self.forward_to_main(&event);
+                self.forward_to_main(&event)?;
+                if is_tc {
+                    // early return here because we only send it to centralized not main broker.
+                    return Ok(());
+                }
             }
         }
+        // now inner llmp manager will process it
         self.inner.fire(state, event)
     }
 
@@ -334,7 +335,7 @@ where
     where
         OT: ObserversTuple<Self::State> + Serialize,
     {
-        self.inner.serialize_observers(observers)
+        Ok(Some(postcard::to_allocvec(observers)?))
     }
 
     #[cfg(feature = "adaptive_serialization")]
@@ -342,40 +343,13 @@ where
     where
         OT: ObserversTuple<Self::State> + Serialize,
     {
-        const SERIALIZE_TIME_FACTOR: u32 = 4;
-        const SERIALIZE_PERCENTAGE_TRESHOLD: usize = 80;
-
-        let exec_time = observers
-            .match_name::<crate::observers::TimeObserver>("time")
-            .map(|o| o.last_runtime().unwrap_or(Duration::ZERO))
-            .unwrap();
-
-        let mut must_ser = (self.serialization_time() + self.deserialization_time())
-            * SERIALIZE_TIME_FACTOR
-            < exec_time;
-        if must_ser {
-            *self.should_serialize_cnt_mut() += 1;
-        }
-
-        if self.serializations_cnt() > 32 {
-            must_ser = (self.should_serialize_cnt() * 100 / self.serializations_cnt())
-                > SERIALIZE_PERCENTAGE_TRESHOLD;
-        }
-
-        if self.inner.serialization_time() == Duration::ZERO
-            || must_ser
-            || self.serializations_cnt().trailing_zeros() >= 8
-        {
-            let start = current_time();
-            let ser = postcard::to_allocvec(observers)?;
-            *self.inner.serialization_time_mut() = current_time() - start;
-
-            *self.serializations_cnt_mut() += 1;
-            Ok(Some(ser))
-        } else {
-            *self.serializations_cnt_mut() += 1;
-            Ok(None)
-        }
+        const SERIALIZE_TIME_FACTOR: u32 = 4; // twice as much as the normal llmp em's value cuz it does this job twice.
+        const SERIALIZE_PERCENTAGE_THRESHOLD: usize = 80;
+        self.inner.serialize_observers_adaptive(
+            observers,
+            SERIALIZE_TIME_FACTOR,
+            SERIALIZE_PERCENTAGE_THRESHOLD,
+        )
     }
 
     fn configuration(&self) -> EventConfig {
@@ -409,7 +383,7 @@ where
 
 impl<E, EM, SP, Z> EventProcessor<E, Z> for CentralizedEventManager<EM, SP>
 where
-    EM: EventStatsCollector + EventProcessor<E, Z> + EventFirer + HasEventManagerId,
+    EM: AdaptiveSerializer + EventProcessor<E, Z> + EventFirer + HasEventManagerId,
     E: HasObservers<State = Self::State> + Executor<Self, Z>,
     for<'a> E::Observers: Deserialize<'a>,
     Z: EvaluatorObservers<E::Observers, State = Self::State>
@@ -435,7 +409,7 @@ where
 
 impl<E, EM, SP, Z> EventManager<E, Z> for CentralizedEventManager<EM, SP>
 where
-    EM: EventStatsCollector + EventManager<E, Z>,
+    EM: AdaptiveSerializer + EventManager<E, Z>,
     EM::State: HasExecutions + HasMetadata + HasLastReportTime,
     E: HasObservers<State = Self::State> + Executor<Self, Z>,
     for<'a> E::Observers: Deserialize<'a>,
@@ -463,7 +437,7 @@ where
 
 impl<EM, SP> ProgressReporter for CentralizedEventManager<EM, SP>
 where
-    EM: EventStatsCollector + ProgressReporter + HasEventManagerId,
+    EM: AdaptiveSerializer + ProgressReporter + HasEventManagerId,
     EM::State: HasMetadata + HasExecutions + HasLastReportTime,
     SP: ShMemProvider + 'static,
 {
@@ -501,9 +475,10 @@ where
     /// will act as a client.
     #[cfg(feature = "std")]
     pub fn on_port(inner: EM, shmem_provider: SP, port: u16, is_main: bool) -> Result<Self, Error> {
+        let client = LlmpClient::create_attach_to_tcp(shmem_provider, port)?;
         Ok(Self {
             inner,
-            client: LlmpClient::create_attach_to_tcp(shmem_provider, port)?,
+            client,
             #[cfg(feature = "llmp_compression")]
             compressor: GzipCompressor::new(COMPRESS_THRESHOLD),
             is_main,
@@ -564,7 +539,7 @@ where
 
 impl<EM, SP> CentralizedEventManager<EM, SP>
 where
-    EM: UsesState + EventFirer + EventStatsCollector + HasEventManagerId,
+    EM: UsesState + EventFirer + AdaptiveSerializer + HasEventManagerId,
     SP: ShMemProvider + 'static,
 {
     #[cfg(feature = "llmp_compression")]
@@ -679,7 +654,7 @@ where
                         {
                             state.scalability_monitor_mut().testcase_with_observers += 1;
                         }
-                        fuzzer.process_execution(
+                        fuzzer.execute_and_process(
                             state,
                             self,
                             input.clone(),

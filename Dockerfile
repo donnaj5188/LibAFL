@@ -16,8 +16,8 @@ RUN sh -c 'echo set encoding=utf-8 > /root/.vimrc' \
     mkdir ~/.cargo && \
     echo "[build]\nrustc-wrapper = \"${RUSTC_WRAPPER}\"" >> ~/.cargo/config
 
-RUN rustup component add rustfmt clippy
 RUN rustup default nightly
+RUN rustup component add rustfmt clippy
 
 # Install clang 18, common build tools
 ENV LLVM_VERSION=18
@@ -80,7 +80,7 @@ COPY scripts/dummy.rs libafl_concolic/symcc_runtime/src/lib.rs
 COPY libafl_concolic/symcc_libafl/Cargo.toml libafl_concolic/symcc_libafl/
 COPY scripts/dummy.rs libafl_concolic/symcc_libafl/src/lib.rs
 
-COPY libafl_nyx/Cargo.toml libafl_nyx/build.rs libafl_nyx/
+COPY libafl_nyx/Cargo.toml libafl_nyx/build.rs libafl_nyx/build_nyx_support.sh libafl_nyx/
 COPY scripts/dummy.rs libafl_nyx/src/lib.rs
 
 COPY libafl_tinyinst/Cargo.toml libafl_tinyinst/
@@ -121,6 +121,8 @@ RUN touch libafl_qemu/libafl_qemu_build/src/lib.rs
 COPY libafl_qemu/libafl_qemu_build/src libafl_qemu/libafl_qemu_build/src
 RUN touch libafl_qemu/libafl_qemu_sys/src/lib.rs
 COPY libafl_qemu/libafl_qemu_sys/src libafl_qemu/libafl_qemu_sys/src
+COPY libafl_qemu/runtime libafl_qemu/runtime
+COPY libafl_qemu/libqasan libafl_qemu/libqasan
 RUN touch libafl_qemu/src/lib.rs
 COPY libafl_qemu/src libafl_qemu/src
 RUN touch libafl_frida/src/lib.rs

@@ -1,21 +1,19 @@
 use std::{path::PathBuf, sync::Mutex};
 
 use hashbrown::{hash_map::Entry, HashMap};
-use libafl::{
-    executors::ExitKind, inputs::UsesInput, observers::ObserversTuple, state::HasMetadata,
-};
+use libafl::{executors::ExitKind, inputs::UsesInput, observers::ObserversTuple, HasMetadata};
+use libafl_qemu_sys::{GuestAddr, GuestUsize};
 use libafl_targets::drcov::{DrCovBasicBlock, DrCovWriter};
 use rangemap::RangeMap;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    emu::{GuestAddr, GuestUsize},
     helper::{
         HasInstrumentationFilter, IsFilter, QemuHelper, QemuHelperTuple,
         QemuInstrumentationAddressRangeFilter,
     },
     hooks::{Hook, QemuHooks},
-    Emulator,
+    Qemu,
 };
 
 static DRCOV_IDS: Mutex<Option<Vec<u64>>> = Mutex::new(None);
@@ -78,7 +76,11 @@ impl QemuDrCovHelper {
     }
 }
 
-impl HasInstrumentationFilter<QemuInstrumentationAddressRangeFilter> for QemuDrCovHelper {
+impl<S: UsesInput> HasInstrumentationFilter<QemuInstrumentationAddressRangeFilter, S>
+    for QemuDrCovHelper
+where
+    S: UsesInput,
+{
     fn filter(&self) -> &QemuInstrumentationAddressRangeFilter {
         &self.filter
     }
@@ -103,11 +105,11 @@ where
         );
     }
 
-    fn pre_exec(&mut self, _emulator: &Emulator, _input: &S::Input) {}
+    fn pre_exec(&mut self, _qemu: Qemu, _input: &S::Input) {}
 
     fn post_exec<OT>(
         &mut self,
-        _emulator: &Emulator,
+        _qemu: Qemu,
         _input: &S::Input,
         _observers: &mut OT,
         _exit_kind: &mut ExitKind,
@@ -200,8 +202,7 @@ pub fn gen_unique_block_ids<QT, S>(
     pc: GuestAddr,
 ) -> Option<u64>
 where
-    S: HasMetadata,
-    S: UsesInput,
+    S: UsesInput + HasMetadata,
     QT: QemuHelperTuple<S>,
 {
     let drcov_helper = hooks
@@ -255,8 +256,7 @@ pub fn gen_block_lengths<QT, S>(
     pc: GuestAddr,
     block_length: GuestUsize,
 ) where
-    S: HasMetadata,
-    S: UsesInput,
+    S: UsesInput + HasMetadata,
     QT: QemuHelperTuple<S>,
 {
     let drcov_helper = hooks
@@ -276,9 +276,8 @@ pub fn gen_block_lengths<QT, S>(
 
 pub fn exec_trace_block<QT, S>(hooks: &mut QemuHooks<QT, S>, _state: Option<&mut S>, id: u64)
 where
-    S: HasMetadata,
-    S: UsesInput,
     QT: QemuHelperTuple<S>,
+    S: UsesInput + HasMetadata,
 {
     if hooks
         .helpers()

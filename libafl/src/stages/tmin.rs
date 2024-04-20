@@ -1,7 +1,7 @@
 //! The [`TMinMutationalStage`] is a stage which will attempt to minimize corpus entries.
 
 use alloc::string::{String, ToString};
-use core::{fmt::Debug, hash::Hash, marker::PhantomData};
+use core::{borrow::BorrowMut, fmt::Debug, hash::Hash, marker::PhantomData};
 
 use ahash::RandomState;
 use libafl_bolts::{HasLen, Named};
@@ -16,13 +16,15 @@ use crate::{
     mutators::{MutationResult, Mutator},
     observers::{MapObserver, ObserversTuple},
     schedulers::{RemovableScheduler, Scheduler},
-    stages::{ExecutionCountRestartHelper, Stage},
+    stages::{
+        mutational::{MutatedTransform, MutatedTransformPost},
+        ExecutionCountRestartHelper, Stage,
+    },
     start_timer,
     state::{
-        HasCorpus, HasCurrentTestcase, HasExecutions, HasMaxSize, HasMetadata, HasSolutions, State,
-        UsesState,
+        HasCorpus, HasCurrentTestcase, HasExecutions, HasMaxSize, HasSolutions, State, UsesState,
     },
-    Error, ExecutesInput, ExecutionProcessor, HasFeedback, HasScheduler,
+    Error, ExecutesInput, ExecutionProcessor, HasFeedback, HasMetadata, HasScheduler,
 };
 #[cfg(feature = "introspection")]
 use crate::{monitors::PerfFeature, state::HasClientPerfMonitor};
@@ -30,7 +32,7 @@ use crate::{monitors::PerfFeature, state::HasClientPerfMonitor};
 /// Mutational stage which minimizes corpus entries.
 ///
 /// You must provide at least one mutator that actually reduces size.
-pub trait TMinMutationalStage<CS, E, EM, F1, F2, M, OT, Z>:
+pub trait TMinMutationalStage<CS, E, EM, F1, F2, I, IP, M, OT, Z>:
     Stage<E, EM, Z> + FeedbackFactory<F2, CS::State, OT>
 where
     Self::State: HasCorpus + HasSolutions + HasExecutions + HasMaxSize,
@@ -40,12 +42,14 @@ where
     EM: EventFirer<State = Self::State>,
     F1: Feedback<Self::State>,
     F2: Feedback<Self::State>,
-    M: Mutator<Self::Input, Self::State>,
+    M: Mutator<I, Self::State>,
     OT: ObserversTuple<CS::State>,
     Z: ExecutionProcessor<OT, State = Self::State>
         + ExecutesInput<E, EM>
         + HasFeedback<Feedback = F1>
         + HasScheduler<Scheduler = CS>,
+    IP: MutatedTransformPost<Self::State> + Clone,
+    I: MutatedTransform<Self::Input, Self::State, Post = IP> + Clone,
 {
     /// The mutator registered for this stage
     fn mutator(&self) -> &M;
@@ -77,7 +81,10 @@ where
             - usize::try_from(self.execs_since_progress_start(state)?).unwrap();
 
         start_timer!(state);
+        let transformed = I::try_transform_from(state.current_testcase_mut()?.borrow_mut(), state)?;
         let mut base = state.current_input_cloned()?;
+        // potential post operation if base is replaced by a shorter input
+        let mut base_post = None;
         let base_hash = RandomState::with_seeds(0, 0, 0, 0).hash_one(&base);
         mark_feature_time!(state, PerfFeature::GetInputFromCorpus);
 
@@ -93,20 +100,21 @@ where
             }
 
             let mut next_i = i + 1;
-            let mut input = base.clone();
+            let mut input_transformed = transformed.clone();
 
-            let before_len = input.len();
+            let before_len = base.len();
 
             state.set_max_size(before_len);
 
             start_timer!(state);
-            let mutated = self.mutator_mut().mutate(state, &mut input)?;
+            let mutated = self.mutator_mut().mutate(state, &mut input_transformed)?;
             mark_feature_time!(state, PerfFeature::Mutate);
 
             if mutated == MutationResult::Skipped {
                 continue;
             }
 
+            let (input, post) = input_transformed.try_transform_into(state)?;
             let corpus_idx = if input.len() < before_len {
                 // run the input
                 let exit_kind = fuzzer.execute_input(state, executor, manager, &input)?;
@@ -118,7 +126,7 @@ where
                 // TODO replace if process_execution adds a return value for solution index
                 let solution_count = state.solutions().count();
                 let corpus_count = state.corpus().count();
-                let (_, corpus_idx) = fuzzer.process_execution(
+                let (_, corpus_idx) = fuzzer.execute_and_process(
                     state,
                     manager,
                     input.clone(),
@@ -134,6 +142,7 @@ where
                     if feedback.is_interesting(state, manager, &input, observers, &exit_kind)? {
                         // we found a reduced corpus entry! use the smaller base
                         base = input;
+                        base_post = Some(post.clone());
 
                         // do more runs! maybe we can minify further
                         next_i = 0;
@@ -149,6 +158,7 @@ where
 
             start_timer!(state);
             self.mutator_mut().post_exec(state, corpus_idx)?;
+            post.post_exec(state, corpus_idx)?;
             mark_feature_time!(state, PerfFeature::MutatePostExec);
 
             i = next_i;
@@ -171,6 +181,11 @@ where
             fuzzer
                 .scheduler_mut()
                 .on_replace(state, base_corpus_idx, &prev)?;
+            // perform the post operation for the new testcase, e.g. to update metadata.
+            // base_post should be updated along with the base (and is no longer None)
+            base_post
+                .ok_or_else(|| Error::empty_optional("Failed to get the MutatedTransformPost"))?
+                .post_exec(state, Some(base_corpus_idx))?;
         }
 
         state.set_max_size(orig_max_size);
@@ -184,7 +199,7 @@ where
 
 /// The default corpus entry minimising mutational stage
 #[derive(Clone, Debug)]
-pub struct StdTMinMutationalStage<CS, E, EM, F1, F2, FF, M, OT, Z> {
+pub struct StdTMinMutationalStage<CS, E, EM, F1, F2, FF, I, IP, M, OT, Z> {
     /// The mutator(s) this stage uses
     mutator: M,
     /// The factory
@@ -194,22 +209,24 @@ pub struct StdTMinMutationalStage<CS, E, EM, F1, F2, FF, M, OT, Z> {
     /// The progress helper for this stage, keeping track of resumes after timeouts/crashes
     restart_helper: ExecutionCountRestartHelper,
     #[allow(clippy::type_complexity)]
-    phantom: PhantomData<(CS, E, EM, F1, F2, OT, Z)>,
+    phantom: PhantomData<(CS, E, EM, F1, F2, I, IP, OT, Z)>,
 }
 
-impl<CS, E, EM, F1, F2, FF, M, OT, Z> UsesState
-    for StdTMinMutationalStage<CS, E, EM, F1, F2, FF, M, OT, Z>
+impl<CS, E, EM, F1, F2, FF, I, IP, M, OT, Z> UsesState
+    for StdTMinMutationalStage<CS, E, EM, F1, F2, FF, I, IP, M, OT, Z>
 where
     CS: Scheduler,
-    M: Mutator<CS::Input, CS::State>,
+    M: Mutator<I, CS::State>,
     Z: ExecutionProcessor<OT, State = CS::State>,
     CS::State: HasCorpus,
+    IP: MutatedTransformPost<CS::State> + Clone,
+    I: MutatedTransform<CS::Input, CS::State, Post = IP> + Clone,
 {
     type State = CS::State;
 }
 
-impl<CS, E, EM, F1, F2, FF, M, OT, Z> Stage<E, EM, Z>
-    for StdTMinMutationalStage<CS, E, EM, F1, F2, FF, M, OT, Z>
+impl<CS, E, EM, F1, F2, FF, I, IP, M, OT, Z> Stage<E, EM, Z>
+    for StdTMinMutationalStage<CS, E, EM, F1, F2, FF, I, IP, M, OT, Z>
 where
     CS: Scheduler + RemovableScheduler,
     CS::State: HasCorpus + HasSolutions + HasExecutions + HasMaxSize + HasCorpus + HasMetadata,
@@ -219,12 +236,14 @@ where
     F1: Feedback<CS::State>,
     F2: Feedback<CS::State>,
     FF: FeedbackFactory<F2, CS::State, OT>,
-    M: Mutator<CS::Input, CS::State>,
+    M: Mutator<I, CS::State>,
     OT: ObserversTuple<CS::State>,
     Z: ExecutionProcessor<OT, State = CS::State>
         + ExecutesInput<E, EM>
         + HasFeedback<Feedback = F1>
         + HasScheduler<Scheduler = CS>,
+    IP: MutatedTransformPost<CS::State> + Clone,
+    I: MutatedTransform<CS::Input, CS::State, Post = IP> + Clone,
 {
     fn perform(
         &mut self,
@@ -250,8 +269,8 @@ where
     }
 }
 
-impl<CS, E, EM, F1, F2, FF, M, OT, Z> FeedbackFactory<F2, Z::State, OT>
-    for StdTMinMutationalStage<CS, E, EM, F1, F2, FF, M, OT, Z>
+impl<CS, E, EM, F1, F2, FF, I, IP, M, OT, Z> FeedbackFactory<F2, Z::State, OT>
+    for StdTMinMutationalStage<CS, E, EM, F1, F2, FF, I, IP, M, OT, Z>
 where
     F2: Feedback<Z::State>,
     FF: FeedbackFactory<F2, Z::State, OT>,
@@ -262,8 +281,8 @@ where
     }
 }
 
-impl<CS, E, EM, F1, F2, FF, M, OT, Z> TMinMutationalStage<CS, E, EM, F1, F2, M, OT, Z>
-    for StdTMinMutationalStage<CS, E, EM, F1, F2, FF, M, OT, Z>
+impl<CS, E, EM, F1, F2, FF, I, IP, M, OT, Z> TMinMutationalStage<CS, E, EM, F1, F2, I, IP, M, OT, Z>
+    for StdTMinMutationalStage<CS, E, EM, F1, F2, FF, I, IP, M, OT, Z>
 where
     CS: Scheduler + RemovableScheduler,
     E: HasObservers<Observers = OT, State = CS::State> + Executor<EM, Z>,
@@ -272,13 +291,15 @@ where
     F2: Feedback<CS::State>,
     FF: FeedbackFactory<F2, CS::State, OT>,
     <CS::State as UsesInput>::Input: HasLen + Hash,
-    M: Mutator<CS::Input, CS::State>,
+    M: Mutator<I, CS::State>,
     OT: ObserversTuple<CS::State>,
     CS::State: HasCorpus + HasSolutions + HasExecutions + HasMaxSize + HasMetadata,
     Z: ExecutionProcessor<OT, State = CS::State>
         + ExecutesInput<E, EM>
         + HasFeedback<Feedback = F1>
         + HasScheduler<Scheduler = CS>,
+    IP: MutatedTransformPost<CS::State> + Clone,
+    I: MutatedTransform<CS::Input, CS::State, Post = IP> + Clone,
 {
     /// The mutator, added to this stage
     #[inline]
@@ -302,12 +323,15 @@ where
     }
 }
 
-impl<CS, E, EM, F1, F2, FF, M, OT, Z> StdTMinMutationalStage<CS, E, EM, F1, F2, FF, M, OT, Z>
+impl<CS, E, EM, F1, F2, FF, I, IP, M, OT, Z>
+    StdTMinMutationalStage<CS, E, EM, F1, F2, FF, I, IP, M, OT, Z>
 where
     CS: Scheduler,
-    M: Mutator<CS::Input, CS::State>,
+    M: Mutator<I, CS::State>,
     Z: ExecutionProcessor<OT, State = CS::State>,
     CS::State: HasCorpus,
+    IP: MutatedTransformPost<CS::State> + Clone,
+    I: MutatedTransform<CS::Input, CS::State, Post = IP> + Clone,
 {
     /// Creates a new minimizing mutational stage that will minimize provided corpus entries
     pub fn new(mutator: M, factory: FF, runs: usize) -> Self {
@@ -376,7 +400,7 @@ where
         let obs = observers
             .match_name::<M>(self.observer_name())
             .expect("Should have been provided valid observer name.");
-        Ok(obs.hash() == self.orig_hash)
+        Ok(obs.hash_simple() == self.orig_hash)
     }
 }
 
@@ -419,7 +443,7 @@ where
         MapEqualityFeedback {
             name: "MapEq".to_string(),
             obs_name: self.obs_name.clone(),
-            orig_hash: obs.hash(),
+            orig_hash: obs.hash_simple(),
             phantom: PhantomData,
         }
     }

@@ -21,10 +21,11 @@ use libafl::{
         token_mutations::Tokens,
         I2SRandReplace,
     },
-    observers::{HitcountsMapObserver, TimeObserver, VariableMapObserver},
+    observers::{CanTrack, HitcountsMapObserver, TimeObserver, VariableMapObserver},
     schedulers::{IndexesLenTimeMinimizerScheduler, QueueScheduler},
     stages::{ShadowTracingStage, StdMutationalStage},
-    state::{HasCorpus, HasMetadata, StdState},
+    state::{HasCorpus, StdState},
+    HasMetadata,
 };
 use libafl_bolts::{
     core_affinity::Cores,
@@ -34,7 +35,7 @@ use libafl_bolts::{
     tuples::{tuple_list, Merge},
     AsSlice,
 };
-pub use libafl_qemu::emu::Emulator;
+pub use libafl_qemu::emu::Qemu;
 #[cfg(not(any(feature = "mips", feature = "hexagon")))]
 use libafl_qemu::QemuCmpLogHelper;
 use libafl_qemu::{edges, QemuEdgeCoverageHelper, QemuExecutor, QemuHooks};
@@ -118,7 +119,7 @@ where
 {
     /// Run the fuzzer
     #[allow(clippy::too_many_lines, clippy::similar_names)]
-    pub fn run(&mut self, emulator: &Emulator) {
+    pub fn run(&mut self, qemu: &Qemu) {
         let conf = match self.configuration.as_ref() {
             Some(name) => EventConfig::from_name(name),
             None => EventConfig::AlwaysUnique,
@@ -155,6 +156,7 @@ where
                     edges_map_mut_slice(),
                     addr_of_mut!(edges::MAX_EDGES_NUM),
                 ))
+                .track_indices()
             };
 
             // Create an observation channel to keep track of the execution time
@@ -167,7 +169,7 @@ where
             // This one is composed by two Feedbacks in OR
             let mut feedback = feedback_or!(
                 // New maximization map feedback linked to the edges observer and the feedback state
-                MaxMapFeedback::tracking(&edges_observer, true, false),
+                MaxMapFeedback::new(&edges_observer),
                 // Time feedback, this one does not need a feedback state
                 TimeFeedback::with_observer(&time_observer)
             );
@@ -199,7 +201,8 @@ where
             }
 
             // A minimization+queue policy to get testcasess from the corpus
-            let scheduler = IndexesLenTimeMinimizerScheduler::new(QueueScheduler::new());
+            let scheduler =
+                IndexesLenTimeMinimizerScheduler::new(&edges_observer, QueueScheduler::new());
 
             // A fuzzer with feedbacks and a corpus scheduler
             let mut fuzzer = StdFuzzer::new(scheduler, feedback, objective);
@@ -208,13 +211,13 @@ where
             let mut harness = |input: &BytesInput| {
                 let target = input.target_bytes();
                 let buf = target.as_slice();
-                (harness_bytes)(buf);
+                harness_bytes(buf);
                 ExitKind::Ok
             };
 
             if self.use_cmplog.unwrap_or(false) {
                 let mut hooks = QemuHooks::new(
-                    emulator.clone(),
+                    *qemu,
                     #[cfg(not(any(feature = "mips", feature = "hexagon")))]
                     tuple_list!(
                         QemuEdgeCoverageHelper::default(),
@@ -325,10 +328,8 @@ where
                     }
                 }
             } else {
-                let mut hooks = QemuHooks::new(
-                    emulator.clone(),
-                    tuple_list!(QemuEdgeCoverageHelper::default()),
-                );
+                let mut hooks =
+                    QemuHooks::new(*qemu, tuple_list!(QemuEdgeCoverageHelper::default()));
 
                 let mut executor = QemuExecutor::new(
                     &mut hooks,
@@ -445,7 +446,7 @@ pub mod pybind {
     use std::path::PathBuf;
 
     use libafl_bolts::core_affinity::Cores;
-    use libafl_qemu::emu::pybind::Emulator;
+    use libafl_qemu::emu::pybind::Qemu;
     use pyo3::{prelude::*, types::PyBytes};
 
     use crate::qemu;
@@ -492,7 +493,7 @@ pub mod pybind {
 
         /// Run the fuzzer
         #[allow(clippy::needless_pass_by_value)]
-        pub fn run(&self, emulator: &Emulator, harness: PyObject) {
+        pub fn run(&self, qemu: &Qemu, harness: PyObject) {
             qemu::QemuBytesCoverageSugar::builder()
                 .input_dirs(&self.input_dirs)
                 .output_dir(self.output_dir.clone())
@@ -511,7 +512,7 @@ pub mod pybind {
                 .tokens_file(self.tokens_file.clone())
                 .iterations(self.iterations)
                 .build()
-                .run(&emulator.emu);
+                .run(&qemu.qemu);
         }
     }
 

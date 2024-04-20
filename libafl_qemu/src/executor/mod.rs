@@ -8,11 +8,7 @@ use core::{
 };
 
 #[cfg(feature = "fork")]
-use libafl::{
-    events::EventManager,
-    executors::InProcessForkExecutor,
-    state::{HasLastReportTime, HasMetadata},
-};
+use libafl::{events::EventManager, executors::InProcessForkExecutor, state::HasLastReportTime};
 use libafl::{
     events::{EventFirer, EventRestarter},
     executors::{
@@ -24,13 +20,13 @@ use libafl::{
     fuzzer::HasObjective,
     observers::{ObserversTuple, UsesObservers},
     state::{HasCorpus, HasExecutions, HasSolutions, State, UsesState},
-    Error,
+    Error, HasMetadata,
 };
 use libafl_bolts::os::unix_signals::{siginfo_t, ucontext_t, Signal};
 #[cfg(feature = "fork")]
 use libafl_bolts::shmem::ShMemProvider;
 
-use crate::{emu::Emulator, helper::QemuHelperTuple, hooks::QemuHooks};
+use crate::{helper::QemuHelperTuple, hooks::QemuHooks, Qemu};
 
 /// A version of `QemuExecutor` with a state accessible from the harness.
 pub mod stateful;
@@ -149,7 +145,7 @@ where
                 unsafe {
                     libafl::executors::inprocess::generic_inproc_crash_handler::<E, EM, OF, Z>();
                 }
-                if let Some(cpu) = hooks.emulator().current_cpu() {
+                if let Some(cpu) = hooks.qemu().current_cpu() {
                     eprint!("Context:\n{}", cpu.display_context());
                 }
             };
@@ -172,8 +168,8 @@ where
     }
 
     #[must_use]
-    pub fn emulator(&self) -> &Emulator {
-        self.hooks.emulator()
+    pub fn qemu(&self) -> &Qemu {
+        self.hooks.qemu()
     }
 }
 
@@ -246,8 +242,8 @@ where
         self.state.hooks_mut()
     }
 
-    pub fn emulator(&self) -> &Emulator {
-        self.state.emulator()
+    pub fn emulator(&self) -> &Qemu {
+        self.state.qemu()
     }
 }
 
@@ -256,7 +252,7 @@ where
     S: State + HasExecutions + HasCorpus + HasSolutions,
     QT: QemuHelperTuple<S> + Debug,
 {
-    fn pre_exec<E, EM, OF, Z>(&mut self, input: &E::Input, emu: &Emulator)
+    fn pre_exec<E, EM, OF, Z>(&mut self, input: &E::Input, qemu: Qemu)
     where
         E: Executor<EM, Z, State = S>,
         EM: EventFirer<State = S> + EventRestarter<State = S>,
@@ -267,13 +263,13 @@ where
             self.hooks.helpers().first_exec_all(self.hooks);
             self.first_exec = false;
         }
-        self.hooks.helpers_mut().pre_exec_all(emu, input);
+        self.hooks.helpers_mut().pre_exec_all(qemu, input);
     }
 
     fn post_exec<E, EM, OT, OF, Z>(
         &mut self,
         input: &E::Input,
-        emu: &Emulator,
+        qemu: Qemu,
         observers: &mut OT,
         exit_kind: &mut ExitKind,
     ) where
@@ -285,7 +281,7 @@ where
     {
         self.hooks
             .helpers_mut()
-            .post_exec_all(emu, input, observers, exit_kind);
+            .post_exec_all(qemu, input, observers, exit_kind);
     }
 }
 
@@ -306,12 +302,12 @@ where
         mgr: &mut EM,
         input: &Self::Input,
     ) -> Result<ExitKind, Error> {
-        let emu = Emulator::get().unwrap();
-        self.state.pre_exec::<Self, EM, OF, Z>(input, &emu);
+        let qemu = Qemu::get().unwrap();
+        self.state.pre_exec::<Self, EM, OF, Z>(input, qemu);
         let mut exit_kind = self.inner.run_target(fuzzer, state, mgr, input)?;
         self.state.post_exec::<Self, EM, OT, OF, Z>(
             input,
-            &emu,
+            qemu,
             self.inner.observers_mut(),
             &mut exit_kind,
         );
@@ -449,8 +445,8 @@ where
         self.state.hooks
     }
 
-    pub fn emulator(&self) -> &Emulator {
-        self.state.hooks.emulator()
+    pub fn qemu(&self) -> &Qemu {
+        self.state.hooks.qemu()
     }
 }
 
@@ -474,15 +470,15 @@ where
         mgr: &mut EM,
         input: &Self::Input,
     ) -> Result<ExitKind, Error> {
-        let emu = Emulator::get().unwrap();
+        let qemu = *self.state.hooks.qemu();
         if self.state.first_exec {
             self.state.hooks.helpers().first_exec_all(self.state.hooks);
             self.state.first_exec = false;
         }
-        self.state.hooks.helpers_mut().pre_exec_all(&emu, input);
+        self.state.hooks.helpers_mut().pre_exec_all(qemu, input);
         let mut exit_kind = self.inner.run_target(fuzzer, state, mgr, input)?;
         self.state.hooks.helpers_mut().post_exec_all(
-            &emu,
+            qemu,
             input,
             self.inner.observers_mut(),
             &mut exit_kind,
