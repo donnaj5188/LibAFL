@@ -4,6 +4,15 @@
 #include "common.h"
 #include <stddef.h>
 
+#ifdef _MSC_VER
+  #define PACKED(__Declaration__) \
+    __pragma(pack(push, 1)) __Declaration__ __pragma(pack(pop))
+#endif
+
+#ifndef _MSC_VER
+  #define PACKED(__Declaration__) __Declaration__ __attribute__((__packed__))
+#endif
+
 #ifndef CMPLOG_MAP_W
   #define CMPLOG_MAP_W 65536
 #endif
@@ -11,12 +20,7 @@
   #define CMPLOG_MAP_H 32
 #endif
 
-// difference between aflpp and libafl
-#ifdef CMPLOG_EXTENDED
-  #define CMPLOG_RTN_LEN 31
-#else
-  #define CMPLOG_RTN_LEN 32
-#endif
+#define CMPLOG_RTN_LEN 32
 
 #define CMPLOG_MAP_RTN_H \
   ((CMPLOG_MAP_H * sizeof(CmpLogInstruction)) / sizeof(CmpLogRoutine))
@@ -27,62 +31,50 @@
 #define CMPLOG_KIND_INS 0
 #define CMPLOG_KIND_RTN 1
 
-// Same, difference between aflpp and libafl
-#define AFL_CMP_TYPE_INS 1
-#define AFL_CMP_TYPE_RTN 2
-
 typedef struct CmpLogHeader {
   uint16_t hits;
   uint8_t  shape;
   uint8_t  kind;
 } CmpLogHeader;
 
-#ifndef _WIN32
-typedef struct CmpLogHeaderExtended {
-  unsigned hits : 24;
-  unsigned id : 24;
+typedef PACKED(struct CmpLogHeaderExtended {
+  unsigned hits : 6;
   unsigned shape : 5;
-  unsigned type : 2;
+  unsigned type : 1;
   unsigned attribute : 4;
-  unsigned overflow : 1;
-  unsigned reserved : 4;
-} __attribute__((packed)) CmpLogHeaderExtended;
-#else
-__pragma(pack(push, 1)) typedef struct CmpLogHeaderExtended {
-  unsigned hits : 24;
-  unsigned id : 24;
-  unsigned shape : 5;
-  unsigned type : 2;
-  unsigned attribute : 4;
-  unsigned overflow : 1;
-  unsigned reserved : 4;
-} CmpLogHeaderExtended;
-__pragma(pack(pop))
-#endif
+}) CmpLogHeaderExtended;
 
 typedef struct CmpLogInstruction {
   uint64_t v0;
   uint64_t v1;
+  uint8_t  v0_is_const;
 } CmpLogInstruction;
 
-typedef struct CmpLogInstructionExtended {
+typedef PACKED(struct CmpLogInstructionExtended {
   uint64_t v0;
-  uint64_t v1;
   uint64_t v0_128;
+  uint64_t
+      v0_256_0;  // u256 is unsupported by any compiler for now, so future use
+  uint64_t v0_256_1;
+  uint64_t v1;
   uint64_t v1_128;
-} CmpLogInstructionExtended;
+  uint64_t v1_256_0;
+  uint64_t v1_256_1;
+  uint8_t  unused[8];
+}) CmpLogInstructionExtended;
 
 typedef struct CmpLogRoutine {
   uint8_t v0[CMPLOG_RTN_LEN];
   uint8_t v1[CMPLOG_RTN_LEN];
 } CmpLogRoutine;
 
-typedef struct CmpLogRoutineExtended {
+typedef PACKED(struct CmpLogRoutineExtended {
   uint8_t v0[CMPLOG_RTN_LEN];
-  uint8_t v0_len;
   uint8_t v1[CMPLOG_RTN_LEN];
+  uint8_t v0_len;
   uint8_t v1_len;
-} CmpLogRoutineExtended;
+  uint8_t unused[6];
+}) CmpLogRoutineExtended;
 
 typedef struct CmpLogMap {
   CmpLogHeader headers[CMPLOG_MAP_W];
@@ -115,7 +107,8 @@ extern uint8_t libafl_cmplog_enabled;
 // cmplog_routines_checked_extended
 
 static inline void cmplog_instructions_checked(uintptr_t k, uint8_t shape,
-                                               uint64_t arg1, uint64_t arg2) {
+                                               uint64_t arg1, uint64_t arg2,
+                                               uint8_t arg1_is_const) {
   if (!libafl_cmplog_enabled) { return; }
   libafl_cmplog_enabled = false;
 
@@ -135,6 +128,7 @@ static inline void cmplog_instructions_checked(uintptr_t k, uint8_t shape,
   hits &= CMPLOG_MAP_H - 1;
   libafl_cmplog_map_ptr->vals.operands[k][hits].v0 = arg1;
   libafl_cmplog_map_ptr->vals.operands[k][hits].v1 = arg2;
+  libafl_cmplog_map_ptr->vals.operands[k][hits].v0_is_const = arg1_is_const;
   libafl_cmplog_enabled = true;
 }
 
@@ -146,8 +140,8 @@ static inline void cmplog_instructions_extended_checked(
 
   // printf("%ld %ld %ld\n", k, arg1, arg2);
   uint16_t hits;
-  if (libafl_cmplog_map_extended_ptr->headers[k].type != AFL_CMP_TYPE_INS) {
-    libafl_cmplog_map_extended_ptr->headers[k].type = AFL_CMP_TYPE_INS;
+  if (libafl_cmplog_map_extended_ptr->headers[k].type != CMPLOG_KIND_INS) {
+    libafl_cmplog_map_extended_ptr->headers[k].type = CMPLOG_KIND_INS;
     libafl_cmplog_map_extended_ptr->headers[k].hits = 1;
     libafl_cmplog_map_extended_ptr->headers[k].shape = shape;
     hits = 0;
@@ -207,8 +201,8 @@ static inline void cmplog_routines_checked_extended(uintptr_t      k,
   libafl_cmplog_enabled = false;
   uint32_t hits;
   // printf("RTN: %ld %ld %ld %ld\n", k, *ptr1, *ptr2, len);
-  if (libafl_cmplog_map_extended_ptr->headers[k].type != AFL_CMP_TYPE_RTN) {
-    libafl_cmplog_map_extended_ptr->headers[k].type = AFL_CMP_TYPE_RTN;
+  if (libafl_cmplog_map_extended_ptr->headers[k].type != CMPLOG_KIND_RTN) {
+    libafl_cmplog_map_extended_ptr->headers[k].type = CMPLOG_KIND_RTN;
     libafl_cmplog_map_extended_ptr->headers[k].hits = 1;
     libafl_cmplog_map_extended_ptr->headers[k].shape = len;
     hits = 0;

@@ -11,30 +11,18 @@ use crate::{
         inmemory_ondisk::InMemoryOnDiskCorpus, ondisk::OnDiskMetadataFormat, Corpus, CorpusId,
         HasTestcase, Testcase,
     },
-    inputs::{Input, UsesInput},
+    inputs::Input,
     Error,
 };
 
 /// A corpus that keeps a maximum number of [`Testcase`]s in memory
 /// and load them from disk, when they are being used.
 /// The eviction policy is FIFO.
-#[cfg(feature = "std")]
 #[derive(Default, Serialize, Deserialize, Clone, Debug)]
-#[serde(bound = "I: serde::de::DeserializeOwned")]
-pub struct CachedOnDiskCorpus<I>
-where
-    I: Input,
-{
+pub struct CachedOnDiskCorpus<I> {
     inner: InMemoryOnDiskCorpus<I>,
     cached_indexes: RefCell<VecDeque<CorpusId>>,
     cache_max_len: usize,
-}
-
-impl<I> UsesInput for CachedOnDiskCorpus<I>
-where
-    I: Input,
-{
-    type Input = I;
 }
 
 impl<I> CachedOnDiskCorpus<I>
@@ -44,21 +32,15 @@ where
     fn cache_testcase<'a>(
         &'a self,
         testcase: &'a RefCell<Testcase<I>>,
-        idx: CorpusId,
-        is_disabled: bool,
+        id: CorpusId,
     ) -> Result<(), Error> {
         if testcase.borrow().input().is_none() {
             self.load_input_into(&mut testcase.borrow_mut())?;
             let mut borrowed_num = 0;
             while self.cached_indexes.borrow().len() >= self.cache_max_len {
                 let removed = self.cached_indexes.borrow_mut().pop_front().unwrap();
-                if let Ok(mut borrowed) = if is_disabled {
-                    self.inner.get_from_all(removed)
-                } else {
-                    self.inner.get(removed)
-                }?
-                .try_borrow_mut()
-                {
+
+                if let Ok(mut borrowed) = self.inner.get_from_all(removed)?.try_borrow_mut() {
                     *borrowed.input_mut() = None;
                 } else {
                     self.cached_indexes.borrow_mut().push_back(removed);
@@ -68,7 +50,7 @@ where
                     }
                 }
             }
-            self.cached_indexes.borrow_mut().push_back(idx);
+            self.cached_indexes.borrow_mut().push_back(id);
         }
         Ok(())
     }
@@ -77,6 +59,8 @@ impl<I> Corpus for CachedOnDiskCorpus<I>
 where
     I: Input,
 {
+    type Input = I;
+
     /// Returns the number of all enabled entries
     #[inline]
     fn count(&self) -> usize {
@@ -108,31 +92,30 @@ where
 
     /// Replaces the testcase at the given idx
     #[inline]
-    fn replace(&mut self, idx: CorpusId, testcase: Testcase<I>) -> Result<Testcase<I>, Error> {
+    fn replace(&mut self, id: CorpusId, testcase: Testcase<I>) -> Result<Testcase<I>, Error> {
         // TODO finish
-        self.inner.replace(idx, testcase)
+        self.inner.replace(id, testcase)
     }
 
-    /// Removes an entry from the corpus, returning it if it was present.
-    #[inline]
-    fn remove(&mut self, idx: CorpusId) -> Result<Testcase<I>, Error> {
-        let testcase = self.inner.remove(idx)?;
-        self.cached_indexes.borrow_mut().retain(|e| *e != idx);
+    /// Removes an entry from the corpus, returning it if it was present; considers both enabled and disabled testcases.
+    fn remove(&mut self, id: CorpusId) -> Result<Testcase<Self::Input>, Error> {
+        let testcase = self.inner.remove(id)?;
+        self.cached_indexes.borrow_mut().retain(|e| *e != id);
         Ok(testcase)
     }
 
     /// Get by id; considers only enabled testcases
     #[inline]
-    fn get(&self, idx: CorpusId) -> Result<&RefCell<Testcase<I>>, Error> {
-        let testcase = { self.inner.get(idx)? };
-        self.cache_testcase(testcase, idx, false)?;
+    fn get(&self, id: CorpusId) -> Result<&RefCell<Testcase<I>>, Error> {
+        let testcase = { self.inner.get(id)? };
+        self.cache_testcase(testcase, id)?;
         Ok(testcase)
     }
     /// Get by id; considers both enabled and disabled testcases
     #[inline]
-    fn get_from_all(&self, idx: CorpusId) -> Result<&RefCell<Testcase<Self::Input>>, Error> {
-        let testcase = { self.inner.get_from_all(idx)? };
-        self.cache_testcase(testcase, idx, true)?;
+    fn get_from_all(&self, id: CorpusId) -> Result<&RefCell<Testcase<Self::Input>>, Error> {
+        let testcase = { self.inner.get_from_all(id)? };
+        self.cache_testcase(testcase, id)?;
         Ok(testcase)
     }
 
@@ -149,13 +132,19 @@ where
     }
 
     #[inline]
-    fn next(&self, idx: CorpusId) -> Option<CorpusId> {
-        self.inner.next(idx)
+    fn next(&self, id: CorpusId) -> Option<CorpusId> {
+        self.inner.next(id)
+    }
+
+    /// Peek the next free corpus id
+    #[inline]
+    fn peek_free_id(&self) -> CorpusId {
+        self.inner.peek_free_id()
     }
 
     #[inline]
-    fn prev(&self, idx: CorpusId) -> Option<CorpusId> {
-        self.inner.prev(idx)
+    fn prev(&self, id: CorpusId) -> Option<CorpusId> {
+        self.inner.prev(id)
     }
 
     #[inline]
@@ -194,22 +183,16 @@ impl<I> HasTestcase for CachedOnDiskCorpus<I>
 where
     I: Input,
 {
-    fn testcase(&self, id: CorpusId) -> Result<core::cell::Ref<Testcase<Self::Input>>, Error> {
+    fn testcase(&self, id: CorpusId) -> Result<core::cell::Ref<Testcase<I>>, Error> {
         Ok(self.get(id)?.borrow())
     }
 
-    fn testcase_mut(
-        &self,
-        id: CorpusId,
-    ) -> Result<core::cell::RefMut<Testcase<Self::Input>>, Error> {
+    fn testcase_mut(&self, id: CorpusId) -> Result<core::cell::RefMut<Testcase<I>>, Error> {
         Ok(self.get(id)?.borrow_mut())
     }
 }
 
-impl<I> CachedOnDiskCorpus<I>
-where
-    I: Input,
-{
+impl<I> CachedOnDiskCorpus<I> {
     /// Creates the [`CachedOnDiskCorpus`].
     ///
     /// This corpus stores (and reads) all testcases to/from disk

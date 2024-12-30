@@ -2,11 +2,7 @@
 //! It should usually be paired with extra error-handling, such as a restarting event manager, to be effective.
 //!
 //! Needs the `fork` feature flag.
-#![allow(clippy::needless_pass_by_value)]
-
 use alloc::boxed::Box;
-#[cfg(any(unix, feature = "std"))]
-use core::ptr::addr_of_mut;
 use core::{
     borrow::BorrowMut,
     ffi::c_void,
@@ -16,7 +12,7 @@ use core::{
     time::Duration,
 };
 
-use libafl_bolts::tuples::tuple_list;
+use libafl_bolts::tuples::{tuple_list, RefIndexable};
 
 #[cfg(any(unix, feature = "std"))]
 use crate::executors::hooks::inprocess::GLOBAL_STATE;
@@ -31,10 +27,12 @@ use crate::{
     feedbacks::Feedback,
     fuzzer::HasObjective,
     inputs::UsesInput,
-    observers::{ObserversTuple, UsesObservers},
-    state::{HasCorpus, HasExecutions, HasSolutions, State, UsesState},
+    observers::ObserversTuple,
+    state::{HasCorpus, HasCurrentTestcase, HasExecutions, HasSolutions, State, UsesState},
     Error, HasMetadata,
 };
+#[cfg(any(unix, feature = "std"))]
+use crate::{ExecutionProcessor, HasScheduler};
 
 /// The inner structure of `InProcessExecutor`.
 pub mod inner;
@@ -57,13 +55,12 @@ pub type OwnedInProcessExecutor<OT, S> = GenericInProcessExecutor<
 >;
 
 /// The inmem executor simply calls a target function, then returns afterwards.
-#[allow(dead_code)]
 pub struct GenericInProcessExecutor<H, HB, HT, OT, S>
 where
     H: FnMut(&S::Input) -> ExitKind + ?Sized,
     HB: BorrowMut<H>,
     HT: ExecutorHooksTuple<S>,
-    OT: ObserversTuple<S>,
+    OT: ObserversTuple<S::Input, S>,
     S: State,
 {
     harness_fn: HB,
@@ -76,7 +73,7 @@ where
     H: FnMut(&S::Input) -> ExitKind + ?Sized,
     HB: BorrowMut<H>,
     HT: ExecutorHooksTuple<S>,
-    OT: ObserversTuple<S> + Debug,
+    OT: ObserversTuple<S::Input, S> + Debug,
     S: State,
 {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
@@ -92,21 +89,10 @@ where
     H: FnMut(&S::Input) -> ExitKind + ?Sized,
     HB: BorrowMut<H>,
     HT: ExecutorHooksTuple<S>,
-    OT: ObserversTuple<S>,
+    OT: ObserversTuple<S::Input, S>,
     S: State,
 {
     type State = S;
-}
-
-impl<H, HB, HT, OT, S> UsesObservers for GenericInProcessExecutor<H, HB, HT, OT, S>
-where
-    H: FnMut(&S::Input) -> ExitKind + ?Sized,
-    HB: BorrowMut<H>,
-    HT: ExecutorHooksTuple<S>,
-    OT: ObserversTuple<S>,
-    S: State,
-{
-    type Observers = OT;
 }
 
 impl<EM, H, HB, HT, OT, S, Z> Executor<EM, Z> for GenericInProcessExecutor<H, HB, HT, OT, S>
@@ -115,9 +101,8 @@ where
     H: FnMut(&S::Input) -> ExitKind + ?Sized,
     HB: BorrowMut<H>,
     HT: ExecutorHooksTuple<S>,
-    OT: ObserversTuple<S>,
+    OT: ObserversTuple<S::Input, S>,
     S: State + HasExecutions,
-    Z: UsesState<State = S>,
 {
     fn run_target(
         &mut self,
@@ -134,7 +119,7 @@ where
         }
         self.inner.hooks.pre_exec_all(state, input);
 
-        let ret = (self.harness_fn.borrow_mut())(input);
+        let ret = self.harness_fn.borrow_mut()(input);
 
         self.inner.hooks.post_exec_all(state, input);
         self.inner.leave_target(fuzzer, state, mgr, input);
@@ -147,16 +132,18 @@ where
     H: FnMut(&S::Input) -> ExitKind + ?Sized,
     HB: BorrowMut<H>,
     HT: ExecutorHooksTuple<S>,
-    OT: ObserversTuple<S>,
+    OT: ObserversTuple<S::Input, S>,
     S: State,
 {
+    type Observers = OT;
+
     #[inline]
-    fn observers(&self) -> &OT {
+    fn observers(&self) -> RefIndexable<&Self::Observers, Self::Observers> {
         self.inner.observers()
     }
 
     #[inline]
-    fn observers_mut(&mut self) -> &mut OT {
+    fn observers_mut(&mut self) -> RefIndexable<&mut Self::Observers, Self::Observers> {
         self.inner.observers_mut()
     }
 }
@@ -164,8 +151,10 @@ where
 impl<'a, H, OT, S> InProcessExecutor<'a, H, OT, S>
 where
     H: FnMut(&S::Input) -> ExitKind + ?Sized,
-    OT: ObserversTuple<S>,
+    OT: ObserversTuple<S::Input, S>,
     S: HasExecutions + HasSolutions + HasCorpus + State,
+    <S as HasSolutions>::Solutions: Corpus<Input = S::Input>, //delete me
+    <<S as HasCorpus>::Corpus as Corpus>::Input: Clone,       //delete me
 {
     /// Create a new in mem executor with the default timeout (5 sec)
     pub fn new<EM, OF, Z>(
@@ -178,9 +167,9 @@ where
     where
         Self: Executor<EM, Z, State = S> + HasObservers,
         EM: EventFirer<State = S> + EventRestarter,
-        OF: Feedback<S>,
+        OF: Feedback<EM, S::Input, OT, S>,
         S: State,
-        Z: HasObjective<Objective = OF, State = S>,
+        Z: HasObjective<Objective = OF>,
     {
         Self::with_timeout_generic(
             tuple_list!(),
@@ -206,9 +195,11 @@ where
     where
         Self: Executor<EM, Z, State = S>,
         EM: EventFirer<State = S> + EventRestarter,
-        OF: Feedback<S>,
+        OF: Feedback<EM, S::Input, OT, S>,
         S: State,
-        Z: HasObjective<Objective = OF, State = S>,
+        Z: HasObjective<Objective = OF>,
+        <S as HasSolutions>::Solutions: Corpus<Input = S::Input>, //delete me
+        <<S as HasCorpus>::Corpus as Corpus>::Input: Clone,       //delete me
     {
         let inner = GenericInProcessExecutorInner::batched_timeout_generic::<Self, EM, OF, Z>(
             tuple_list!(),
@@ -232,6 +223,7 @@ where
     /// * `user_hooks` - the hooks run before and after the harness's execution
     /// * `harness_fn` - the harness, executing the function
     /// * `observers` - the observers observing the target during execution
+    ///
     /// This may return an error on unix, if signal handler setup fails
     pub fn with_timeout<EM, OF, Z>(
         harness_fn: &'a mut H,
@@ -242,11 +234,13 @@ where
         timeout: Duration,
     ) -> Result<Self, Error>
     where
-        Self: Executor<EM, Z, State = S> + HasObservers,
+        Self: Executor<EM, Z, State = S>,
         EM: EventFirer<State = S> + EventRestarter,
-        OF: Feedback<S>,
+        OF: Feedback<EM, S::Input, OT, S>,
         S: State,
-        Z: HasObjective<Objective = OF, State = S>,
+        Z: HasObjective<Objective = OF>,
+        <S as HasSolutions>::Solutions: Corpus<Input = S::Input>, //delete me
+        <<S as HasCorpus>::Corpus as Corpus>::Input: Clone,       //delete me
     {
         let inner = GenericInProcessExecutorInner::with_timeout_generic::<Self, EM, OF, Z>(
             tuple_list!(),
@@ -270,8 +264,10 @@ where
     H: FnMut(&S::Input) -> ExitKind + ?Sized,
     HB: BorrowMut<H>,
     HT: ExecutorHooksTuple<S>,
-    OT: ObserversTuple<S>,
+    OT: ObserversTuple<S::Input, S>,
     S: State + HasExecutions + HasSolutions + HasCorpus,
+    <S as HasSolutions>::Solutions: Corpus<Input = S::Input>, //delete me
+    <<S as HasCorpus>::Corpus as Corpus>::Input: Clone,       //delete me
 {
     /// Create a new in mem executor with the default timeout (5 sec)
     pub fn generic<EM, OF, Z>(
@@ -283,11 +279,11 @@ where
         event_mgr: &mut EM,
     ) -> Result<Self, Error>
     where
-        Self: Executor<EM, Z, State = S> + HasObservers,
+        Self: Executor<EM, Z, State = S>,
         EM: EventFirer<State = S> + EventRestarter,
-        OF: Feedback<S>,
+        OF: Feedback<EM, S::Input, OT, S>,
         S: State,
-        Z: HasObjective<Objective = OF, State = S>,
+        Z: HasObjective<Objective = OF>,
     {
         Self::with_timeout_generic(
             user_hooks,
@@ -312,11 +308,13 @@ where
         exec_tmout: Duration,
     ) -> Result<Self, Error>
     where
-        Self: Executor<EM, Z, State = S> + HasObservers,
+        Self: Executor<EM, Z, State = S>,
         EM: EventFirer<State = S> + EventRestarter,
-        OF: Feedback<S>,
+        OF: Feedback<EM, S::Input, OT, S>,
         S: State,
-        Z: HasObjective<Objective = OF, State = S>,
+        Z: HasObjective<Objective = OF>,
+        <S as HasSolutions>::Solutions: Corpus<Input = S::Input>, //delete me
+        <<S as HasCorpus>::Corpus as Corpus>::Input: Clone,       //delete me
     {
         let inner = GenericInProcessExecutorInner::batched_timeout_generic::<Self, EM, OF, Z>(
             user_hooks, observers, fuzzer, state, event_mgr, exec_tmout,
@@ -329,12 +327,13 @@ where
         })
     }
 
-    /// Create a new in mem executor.
+    /// Create a new [`InProcessExecutor`].
     /// Caution: crash and restart in one of them will lead to odd behavior if multiple are used,
     /// depending on different corpus or state.
     /// * `user_hooks` - the hooks run before and after the harness's execution
     /// * `harness_fn` - the harness, executing the function
     /// * `observers` - the observers observing the target during execution
+    ///
     /// This may return an error on unix, if signal handler setup fails
     pub fn with_timeout_generic<EM, OF, Z>(
         user_hooks: HT,
@@ -346,11 +345,13 @@ where
         timeout: Duration,
     ) -> Result<Self, Error>
     where
-        Self: Executor<EM, Z, State = S> + HasObservers,
+        Self: Executor<EM, Z, State = S>,
         EM: EventFirer<State = S> + EventRestarter,
-        OF: Feedback<S>,
+        OF: Feedback<EM, S::Input, OT, S>,
         S: State,
-        Z: HasObjective<Objective = OF, State = S>,
+        Z: HasObjective<Objective = OF>,
+        <S as HasSolutions>::Solutions: Corpus<Input = S::Input>, //delete me
+        <<S as HasCorpus>::Corpus as Corpus>::Input: Clone,       //delete me
     {
         let inner = GenericInProcessExecutorInner::with_timeout_generic::<Self, EM, OF, Z>(
             user_hooks, observers, fuzzer, state, event_mgr, timeout,
@@ -405,7 +406,7 @@ where
     H: FnMut(&<S as UsesInput>::Input) -> ExitKind + ?Sized,
     HB: BorrowMut<H>,
     HT: ExecutorHooksTuple<S>,
-    OT: ObserversTuple<S>,
+    OT: ObserversTuple<S::Input, S>,
     S: State + HasExecutions + HasSolutions + HasCorpus,
 {
     /// the timeout handler
@@ -422,23 +423,24 @@ where
 }
 
 #[inline]
-#[allow(clippy::too_many_arguments)]
 /// Save state if it is an objective
 pub fn run_observers_and_save_state<E, EM, OF, Z>(
     executor: &mut E,
     state: &mut E::State,
-    input: &<E::State as UsesInput>::Input,
+    input: &E::Input,
     fuzzer: &mut Z,
     event_mgr: &mut EM,
     exitkind: ExitKind,
 ) where
-    E: HasObservers,
+    E: Executor<EM, Z> + HasObservers,
+    E::Observers: ObserversTuple<<E::State as UsesInput>::Input, E::State>,
     EM: EventFirer<State = E::State> + EventRestarter<State = E::State>,
-    OF: Feedback<E::State>,
-    E::State: HasExecutions + HasSolutions + HasCorpus,
-    Z: HasObjective<Objective = OF, State = E::State>,
+    OF: Feedback<EM, E::Input, E::Observers, E::State>,
+    E::State: HasExecutions + HasSolutions + HasCorpus + HasCurrentTestcase,
+    Z: HasObjective<Objective = OF>,
+    <<E as UsesState>::State as HasSolutions>::Solutions: Corpus<Input = E::Input>, //delete me
 {
-    let observers = executor.observers_mut();
+    let mut observers = executor.observers_mut();
 
     observers
         .post_exec_all(state, input, &exitkind)
@@ -446,17 +448,21 @@ pub fn run_observers_and_save_state<E, EM, OF, Z>(
 
     let interesting = fuzzer
         .objective_mut()
-        .is_interesting(state, event_mgr, input, observers, &exitkind)
+        .is_interesting(state, event_mgr, input, &*observers, &exitkind)
         .expect("In run_observers_and_save_state objective failure.");
 
     if interesting {
-        let executions = *state.executions();
-        let mut new_testcase = Testcase::with_executions(input.clone(), executions);
+        let mut new_testcase = Testcase::from(input.clone());
         new_testcase.add_metadata(exitkind);
         new_testcase.set_parent_id_optional(*state.corpus().current());
+
+        if let Ok(mut tc) = state.current_testcase_mut() {
+            tc.found_objective();
+        }
+
         fuzzer
             .objective_mut()
-            .append_metadata(state, event_mgr, observers, &mut new_testcase)
+            .append_metadata(state, event_mgr, &*observers, &mut new_testcase)
             .expect("Failed adding metadata");
         state
             .solutions_mut()
@@ -467,7 +473,6 @@ pub fn run_observers_and_save_state<E, EM, OF, Z>(
                 state,
                 Event::Objective {
                     objective_size: state.solutions().count(),
-                    executions,
                     time: libafl_bolts::current_time(),
                 },
             )
@@ -489,12 +494,16 @@ pub fn run_observers_and_save_state<E, EM, OF, Z>(
 pub unsafe fn generic_inproc_crash_handler<E, EM, OF, Z>()
 where
     E: Executor<EM, Z> + HasObservers,
+    E::Observers: ObserversTuple<<E::State as UsesInput>::Input, E::State>,
     EM: EventFirer<State = E::State> + EventRestarter<State = E::State>,
-    OF: Feedback<E::State>,
-    E::State: HasExecutions + HasSolutions + HasCorpus,
-    Z: HasObjective<Objective = OF, State = E::State>,
+    OF: Feedback<EM, E::Input, E::Observers, E::State>,
+    E::State: HasExecutions + HasSolutions + HasCorpus + HasCurrentTestcase,
+    Z: HasObjective<Objective = OF>
+        + HasScheduler<E::Input, E::State>
+        + ExecutionProcessor<EM, E::Input, E::Observers, E::State>,
+    <<E as UsesState>::State as HasSolutions>::Solutions: Corpus<Input = E::Input>, //delete me
 {
-    let data = addr_of_mut!(GLOBAL_STATE);
+    let data = &raw mut GLOBAL_STATE;
     let in_handler = (*data).set_in_handler(true);
 
     if (*data).is_valid() {
@@ -519,7 +528,7 @@ where
 
 #[cfg(test)]
 mod tests {
-    use libafl_bolts::tuples::tuple_list;
+    use libafl_bolts::{rands::XkcdRand, tuples::tuple_list};
 
     use crate::{
         corpus::InMemoryCorpus,
@@ -528,7 +537,7 @@ mod tests {
         feedbacks::CrashFeedback,
         inputs::{NopInput, UsesInput},
         schedulers::RandScheduler,
-        state::StdState,
+        state::{NopState, StdState},
         StdFuzzer,
     };
 
@@ -537,19 +546,18 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::let_unit_value)]
     fn test_inmem_exec() {
         let mut harness = |_buf: &NopInput| ExitKind::Ok;
-        let rand = libafl_bolts::rands::XkcdRand::new();
+        let rand = XkcdRand::new();
         let corpus = InMemoryCorpus::<NopInput>::new();
         let solutions = InMemoryCorpus::new();
         let mut objective = CrashFeedback::new();
         let mut feedback = tuple_list!();
-        let sche = RandScheduler::new();
+        let sche: RandScheduler<NopState<NopInput>> = RandScheduler::new();
         let mut mgr = NopEventManager::new();
         let mut state =
             StdState::new(rand, corpus, solutions, &mut feedback, &mut objective).unwrap();
-        let mut fuzzer = StdFuzzer::<_, _, _, ()>::new(sche, feedback, objective);
+        let mut fuzzer = StdFuzzer::new(sche, feedback, objective);
 
         let mut in_process_executor = InProcessExecutor::new(
             &mut harness,

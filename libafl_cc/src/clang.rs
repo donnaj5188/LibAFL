@@ -24,7 +24,6 @@ fn dll_extension<'a>() -> &'a str {
 include!(concat!(env!("OUT_DIR"), "/clang_constants.rs"));
 
 /// The supported LLVM passes
-#[allow(clippy::upper_case_acronyms)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LLVMPasses {
     //CmpLogIns,
@@ -41,6 +40,10 @@ pub enum LLVMPasses {
     CmpLogInstructions,
     /// Instrument caller for sancov coverage
     Ctx,
+    /// Function logging
+    FunctionLogging,
+    /// Profiling
+    Profiling,
     /// Data dependency instrumentation
     DDG,
 }
@@ -66,6 +69,12 @@ impl LLVMPasses {
             LLVMPasses::Ctx => {
                 PathBuf::from(env!("OUT_DIR")).join(format!("ctx-pass.{}", dll_extension()))
             }
+            LLVMPasses::FunctionLogging => {
+                PathBuf::from(env!("OUT_DIR")).join(format!("function-logging.{}", dll_extension()))
+            }
+            LLVMPasses::Profiling => {
+                PathBuf::from(env!("OUT_DIR")).join(format!("profiling.{}", dll_extension()))
+            }
             LLVMPasses::DDG => {
                 PathBuf::from(env!("OUT_DIR")).join(format!("ddg-instr.{}", dll_extension()))
             }
@@ -74,7 +83,7 @@ impl LLVMPasses {
 }
 
 /// Wrap Clang
-#[allow(clippy::struct_excessive_bools)]
+#[expect(clippy::struct_excessive_bools)]
 #[derive(Debug)]
 pub struct ClangWrapper {
     is_silent: bool,
@@ -105,9 +114,9 @@ pub struct ClangWrapper {
     passes_linking_args: Vec<String>,
 }
 
-#[allow(clippy::match_same_arms)] // for the linking = false wip for "shared"
+#[expect(clippy::match_same_arms)] // for the linking = false wip for "shared"
 impl ToolWrapper for ClangWrapper {
-    #[allow(clippy::too_many_lines)]
+    #[expect(clippy::too_many_lines)]
     fn parse_args<S>(&mut self, args: &[S]) -> Result<&'_ mut Self, Error>
     where
         S: AsRef<str>,
@@ -161,7 +170,7 @@ impl ToolWrapper for ClangWrapper {
 
             if arg_as_path
                 .extension()
-                .map_or(false, |ext| ext.eq_ignore_ascii_case("s"))
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("s"))
             {
                 self.is_asm = true;
             }
@@ -278,7 +287,7 @@ impl ToolWrapper for ClangWrapper {
         if linking {
             new_args.push("-lrt".into());
         }
-        // MacOS has odd linker behavior sometimes
+        // `MacOS` has odd linker behavior sometimes
         #[cfg(target_vendor = "apple")]
         if linking || shared {
             new_args.push("-undefined".into());
@@ -316,7 +325,7 @@ impl ToolWrapper for ClangWrapper {
         self.command_for_configuration(crate::Configuration::Default)
     }
 
-    #[allow(clippy::too_many_lines)]
+    #[expect(clippy::too_many_lines)]
     fn command_for_configuration(
         &mut self,
         configuration: crate::Configuration,

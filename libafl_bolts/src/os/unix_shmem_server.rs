@@ -10,7 +10,10 @@ use alloc::{
     string::{String, ToString},
     vec::Vec,
 };
-use core::{mem::ManuallyDrop, ptr::addr_of};
+use core::{
+    mem::ManuallyDrop,
+    ops::{Deref, DerefMut},
+};
 #[cfg(target_vendor = "apple")]
 use std::fs;
 use std::{
@@ -18,6 +21,7 @@ use std::{
     env,
     io::{Read, Write},
     marker::PhantomData,
+    os::fd::{AsFd, BorrowedFd},
     rc::{Rc, Weak},
     sync::{Arc, Condvar, Mutex},
     thread::JoinHandle,
@@ -32,6 +36,7 @@ use std::{
 };
 
 use hashbrown::HashMap;
+use nix::poll::PollTimeout;
 #[cfg(all(feature = "std", unix))]
 use nix::poll::{poll, PollFd, PollFlags};
 use serde::{Deserialize, Serialize};
@@ -40,7 +45,7 @@ use uds::{UnixListenerExt, UnixSocketAddr, UnixStreamExt};
 
 use crate::{
     shmem::{ShMem, ShMemDescription, ShMemId, ShMemProvider},
-    AsMutSlice, AsSlice, Error,
+    Error,
 };
 
 /// The default server name for our abstract shmem server
@@ -79,6 +84,26 @@ where
     server_fd: i32,
 }
 
+impl<SH> Deref for ServedShMem<SH>
+where
+    SH: ShMem,
+{
+    type Target = [u8];
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
+impl<SH> DerefMut for ServedShMem<SH>
+where
+    SH: ShMem,
+{
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.inner
+    }
+}
+
 impl<SH> ShMem for ServedShMem<SH>
 where
     SH: ShMem,
@@ -87,29 +112,6 @@ where
         let client_id = self.inner.id();
         ShMemId::from_string(&format!("{}:{client_id}", self.server_fd))
     }
-
-    fn len(&self) -> usize {
-        self.inner.len()
-    }
-}
-
-impl<SH> AsSlice for ServedShMem<SH>
-where
-    SH: ShMem,
-{
-    type Entry = u8;
-    fn as_slice(&self) -> &[u8] {
-        self.inner.as_slice()
-    }
-}
-impl<SH> AsMutSlice for ServedShMem<SH>
-where
-    SH: ShMem,
-{
-    type Entry = u8;
-    fn as_mut_slice(&mut self) -> &mut [u8] {
-        self.inner.as_mut_slice()
-    }
 }
 
 impl<SP> ServedShMemProvider<SP>
@@ -117,7 +119,7 @@ where
     SP: ShMemProvider,
 {
     /// Send a request to the server, and wait for a response
-    #[allow(clippy::similar_names)] // id and fd
+    #[expect(clippy::similar_names)] // id and fd
     fn send_receive(&mut self, request: ServedShMemRequest) -> Result<(i32, i32), Error> {
         //let bt = Backtrace::new();
         //log::info!("Sending {:?} with bt:\n{:?}", request, bt);
@@ -179,7 +181,7 @@ where
     /// Connect to the server and return a new [`ServedShMemProvider`]
     /// Will try to spawn a [`ShMemService`]. This will only work for the first try.
     fn new() -> Result<Self, Error> {
-        // Needed for MacOS and Android to get sharedmaps working.
+        // Needed for `MacOS` and Android to get sharedmaps working.
         let service = ShMemService::<SP>::start();
 
         let mut res = Self {
@@ -407,7 +409,6 @@ where
             };
         }
 
-        #[allow(clippy::mutex_atomic)]
         let syncpair = Arc::new((Mutex::new(ShMemServiceStatus::Starting), Condvar::new()));
         let childsyncpair = Arc::clone(&syncpair);
         let join_handle = thread::spawn(move || {
@@ -470,7 +471,7 @@ where
 }
 
 /// The struct for the worker, handling incoming requests for [`ShMem`].
-#[allow(clippy::type_complexity)]
+#[expect(clippy::type_complexity)]
 struct ServedShMemServiceWorker<SP>
 where
     SP: ShMemProvider,
@@ -565,7 +566,7 @@ where
 
                 if client.maps.contains_key(&description_id) {
                     // Using let else here as self needs to be accessed in the else branch.
-                    #[allow(clippy::option_if_let_else)]
+                    #[expect(clippy::option_if_let_else)]
                     Ok(ServedShMemResponse::Mapping(
                         if let Some(map) = client
                             .maps
@@ -671,7 +672,7 @@ where
         };
 
         let mut poll_fds: Vec<PollFd> = vec![PollFd::new(
-            &listener,
+            listener.as_fd(),
             PollFlags::POLLIN | PollFlags::POLLRDNORM | PollFlags::POLLRDBAND,
         )];
 
@@ -680,7 +681,7 @@ where
         cvar.notify_one();
 
         loop {
-            match poll(&mut poll_fds, -1) {
+            match poll(&mut poll_fds, PollTimeout::NONE) {
                 Ok(num_fds) if num_fds > 0 => (),
                 Ok(_) => continue,
                 Err(e) => {
@@ -691,7 +692,7 @@ where
             let copied_poll_fds: Vec<PollFd> = poll_fds.clone();
             for poll_fd in copied_poll_fds {
                 let revents = poll_fd.revents().expect("revents should not be None");
-                let raw_polled_fd = unsafe { *((addr_of!(poll_fd)) as *const libc::pollfd) }.fd;
+                let raw_polled_fd = unsafe { *((&raw const poll_fd) as *const libc::pollfd) }.fd;
                 if revents.contains(PollFlags::POLLHUP) {
                     poll_fds.remove(poll_fds.iter().position(|item| *item == poll_fd).unwrap());
                     self.clients.remove(&raw_polled_fd);
@@ -717,11 +718,10 @@ where
 
                         let pollfd = PollFd::new(
                             // # Safety
-                            // This cast will make `PollFd::new` ignore the lifetime of our stream.
+                            // Going through a raw fd will make `PollFd::new` ignore the lifetime of our stream.
                             // As of nix 0.27, the `PollFd` is safer, in that it checks the lifetime of the given stream.
-                            // We did not develop this server with that new constraint in mind, but it is upheld.
-                            // The `new` function then gets the `raw_fd` from this stream, and operate on that int internally.
-                            unsafe { &*(&stream as *const _) },
+                            // We did not develop this server with that new constraint in mind, but it is upheld by our code.
+                            unsafe { BorrowedFd::borrow_raw(stream.as_raw_fd()) },
                             PollFlags::POLLIN | PollFlags::POLLRDNORM | PollFlags::POLLRDBAND,
                         );
 

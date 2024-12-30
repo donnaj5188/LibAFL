@@ -1,31 +1,21 @@
-use alloc::{
-    string::{String, ToString},
-    vec::Vec,
-};
+use alloc::{borrow::Cow, vec::Vec};
 use core::fmt::Debug;
 
 use libafl_bolts::{ownedref::OwnedMutPtr, Error, Named};
 use serde::{Deserialize, Serialize};
 
-use crate::{inputs::UsesInput, observers::Observer};
+use crate::observers::Observer;
 
 /// A simple observer with a list of things.
 #[derive(Serialize, Deserialize, Debug)]
-#[serde(bound = "T: serde::de::DeserializeOwned")]
-#[allow(clippy::unsafe_derive_deserialize)]
-pub struct ListObserver<T>
-where
-    T: Debug + Serialize,
-{
-    name: String,
+#[serde(bound = "T: Serialize + for<'a> Deserialize<'a>")]
+pub struct ListObserver<T> {
+    name: Cow<'static, str>,
     /// The list
     list: OwnedMutPtr<Vec<T>>,
 }
 
-impl<T> ListObserver<T>
-where
-    T: Debug + Serialize + serde::de::DeserializeOwned,
-{
+impl<T> ListObserver<T> {
     /// Creates a new [`ListObserver`] with the given name.
     ///
     /// # Safety
@@ -34,7 +24,7 @@ where
     #[must_use]
     pub fn new(name: &'static str, list: OwnedMutPtr<Vec<T>>) -> Self {
         Self {
-            name: name.to_string(),
+            name: Cow::from(name),
             list,
         }
     }
@@ -52,22 +42,15 @@ where
     }
 }
 
-impl<S, T> Observer<S> for ListObserver<T>
-where
-    S: UsesInput,
-    T: Debug + Serialize + serde::de::DeserializeOwned,
-{
-    fn pre_exec(&mut self, _state: &mut S, _input: &S::Input) -> Result<(), Error> {
+impl<I, S, T> Observer<I, S> for ListObserver<T> {
+    fn pre_exec(&mut self, _state: &mut S, _input: &I) -> Result<(), Error> {
         self.list.as_mut().clear();
         Ok(())
     }
 }
 
-impl<T> Named for ListObserver<T>
-where
-    T: Debug + Serialize + serde::de::DeserializeOwned,
-{
-    fn name(&self) -> &str {
+impl<T> Named for ListObserver<T> {
+    fn name(&self) -> &Cow<'static, str> {
         &self.name
     }
 }

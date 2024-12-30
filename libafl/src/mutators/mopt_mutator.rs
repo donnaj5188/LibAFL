@@ -1,15 +1,13 @@
-//! The `MOpt` mutator scheduler, see <https://github.com/puppet-meteor/MOpt-AFL> and <https://www.usenix.org/conference/usenixsecurity19/presentation/lyu>
-use alloc::{
-    string::{String, ToString},
-    vec::Vec,
-};
-use core::{
-    fmt::{self, Debug},
-    marker::PhantomData,
-};
+//! The `MOpt` mutation scheduler used in AFL++.
+//!
+//! It uses a modified Particle Swarm Optimization algorithm to determine an optimal distribution of mutators.
+//! See <https://github.com/puppet-meteor/MOpt-AFL> and <https://www.usenix.org/conference/usenixsecurity19/presentation/lyu>
+use alloc::{borrow::Cow, string::ToString, vec::Vec};
+use core::fmt::{self, Debug};
 
 use libafl_bolts::{
     rands::{Rand, StdRand},
+    tuples::NamedTuple,
     Named,
 };
 use serde::{Deserialize, Serialize};
@@ -23,14 +21,15 @@ use crate::{
 };
 
 /// A Struct for managing MOpt-mutator parameters.
+///
 /// There are 2 modes for `MOpt` scheduler, the core fuzzing mode and the pilot fuzzing mode.
 /// In short, in the pilot fuzzing mode, the fuzzer employs several `swarms` to compute the probability to choose the mutation operator.
-/// On the other hand, in the core fuzzing mode, the fuzzer chooses the best `swarms`, which was determined during the pilot fuzzing mode, to compute the probability to choose the operation operator.
+/// On the other hand, in the core fuzzing mode, the fuzzer chooses the best `swarms`, which was determined during the pilot fuzzing mode, to compute the probability to choose the mutation operator.
 /// With the current implementation we are always in the pacemaker fuzzing mode.
 #[derive(Serialize, Deserialize, Clone)]
 #[cfg_attr(
     any(not(feature = "serdeany_autoreg"), miri),
-    allow(clippy::unsafe_derive_deserialize)
+    expect(clippy::unsafe_derive_deserialize)
 )] // for SerdeAny
 pub struct MOpt {
     /// Random number generator
@@ -190,7 +189,6 @@ impl MOpt {
     }
 
     /// initialize pso
-    #[allow(clippy::cast_precision_loss)]
     pub fn pso_initialize(&mut self) -> Result<(), Error> {
         if self.g_now > self.g_max {
             self.g_now = 0.0;
@@ -202,7 +200,7 @@ impl MOpt {
             let mut total_x_now = 0.0;
             let mut x_sum = 0.0;
             for i in 0..self.operator_num {
-                self.x_now[swarm][i] = (self.rand.below(7000) as f64) * 0.0001 + 0.1;
+                self.x_now[swarm][i] = 0.7 * self.rand.next_float() + 0.1;
                 total_x_now += self.x_now[swarm][i];
                 self.v_now[swarm][i] = 0.1;
                 self.l_best[swarm][i] = 0.5;
@@ -215,12 +213,8 @@ impl MOpt {
 
             for i in 0..self.operator_num {
                 self.v_now[swarm][i] = self.w_now * self.v_now[swarm][i]
-                    + (self.rand.below(1000) as f64)
-                        * 0.001
-                        * (self.l_best[swarm][i] - self.x_now[swarm][i])
-                    + (self.rand.below(1000) as f64)
-                        * 0.001
-                        * (self.g_best[i] - self.x_now[swarm][i]);
+                    + self.rand.next_float() * (self.l_best[swarm][i] - self.x_now[swarm][i])
+                    + self.rand.next_float() * (self.g_best[i] - self.x_now[swarm][i]);
                 self.x_now[swarm][i] += self.v_now[swarm][i];
 
                 self.x_now[swarm][i] = self.x_now[swarm][i].clamp(V_MIN, V_MAX);
@@ -250,7 +244,7 @@ impl MOpt {
 
     /// Update the `PSO` algorithm parameters
     /// See <https://github.com/puppet-meteor/MOpt-AFL/blob/master/MOpt/afl-fuzz.c#L10623>
-    #[allow(clippy::cast_precision_loss)]
+    #[expect(clippy::cast_precision_loss)]
     pub fn pso_update(&mut self) -> Result<(), Error> {
         self.g_now += 1.0;
         if self.g_now > self.g_max {
@@ -282,12 +276,8 @@ impl MOpt {
             for i in 0..self.operator_num {
                 self.probability_now[swarm][i] = 0.0;
                 self.v_now[swarm][i] = self.w_now * self.v_now[swarm][i]
-                    + (self.rand.below(1000) as f64)
-                        * 0.001
-                        * (self.l_best[swarm][i] - self.x_now[swarm][i])
-                    + (self.rand.below(1000) as f64)
-                        * 0.001
-                        * (self.g_best[i] - self.x_now[swarm][i]);
+                    + self.rand.next_float() * (self.l_best[swarm][i] - self.x_now[swarm][i])
+                    + self.rand.next_float() * (self.g_best[i] - self.x_now[swarm][i]);
                 self.x_now[swarm][i] += self.v_now[swarm][i];
 
                 self.x_now[swarm][i] = self.x_now[swarm][i].clamp(V_MIN, V_MAX);
@@ -320,7 +310,6 @@ impl MOpt {
 
     /// This function is used to decide the operator that we want to apply next
     /// see <https://github.com/puppet-meteor/MOpt-AFL/blob/master/MOpt/afl-fuzz.c#L397>
-    #[allow(clippy::cast_precision_loss)]
     pub fn select_algorithm(&mut self) -> Result<MutationId, Error> {
         let mut res = 0;
         let mut sentry = 0;
@@ -328,8 +317,8 @@ impl MOpt {
         let operator_num = self.operator_num;
 
         // Fetch a random sele value
-        let select_prob: f64 = self.probability_now[self.swarm_now][operator_num - 1]
-            * ((self.rand.below(10000) as f64) * 0.0001);
+        let select_prob: f64 =
+            self.probability_now[self.swarm_now][operator_num - 1] * self.rand.next_float();
 
         for i in 0..operator_num {
             if i == 0 {
@@ -370,35 +359,16 @@ pub enum MOptMode {
 
 /// This is the main struct of `MOpt`, an `AFL` mutator.
 /// See the original `MOpt` implementation in <https://github.com/puppet-meteor/MOpt-AFL>
-pub struct StdMOptMutator<I, MT, S>
-where
-    MT: MutatorsTuple<I, S>,
-    S: HasRand + HasMetadata + HasCorpus + HasSolutions,
-{
-    name: String,
+#[derive(Debug)]
+pub struct StdMOptMutator<MT> {
+    name: Cow<'static, str>,
     mode: MOptMode,
     finds_before: usize,
     mutations: MT,
-    max_stack_pow: u64,
-    phantom: PhantomData<(I, S)>,
+    max_stack_pow: usize,
 }
 
-impl<I, MT, S> Debug for StdMOptMutator<I, MT, S>
-where
-    MT: MutatorsTuple<I, S>,
-    S: HasRand + HasMetadata + HasCorpus + HasSolutions,
-{
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "StdMOptMutator with {} mutations for Input type {}",
-            self.mutations.len(),
-            core::any::type_name::<I>()
-        )
-    }
-}
-
-impl<I, MT, S> Mutator<I, S> for StdMOptMutator<I, MT, S>
+impl<I, MT, S> Mutator<I, S> for StdMOptMutator<MT>
 where
     MT: MutatorsTuple<I, S>,
     S: HasRand + HasMetadata + HasCorpus + HasSolutions,
@@ -409,8 +379,8 @@ where
         self.scheduled_mutate(state, input)
     }
 
-    #[allow(clippy::cast_precision_loss)]
-    fn post_exec(&mut self, state: &mut S, _new_corpus_idx: Option<CorpusId>) -> Result<(), Error> {
+    #[expect(clippy::cast_precision_loss)]
+    fn post_exec(&mut self, state: &mut S, _new_corpus_id: Option<CorpusId>) -> Result<(), Error> {
         let before = self.finds_before;
         let after = state.corpus().count() + state.solutions().count();
 
@@ -458,7 +428,6 @@ where
                     }
                 }
 
-                #[allow(clippy::cast_lossless)]
                 if mopt.pilot_time > mopt.period_pilot {
                     let new_finds = mopt.total_finds - mopt.finds_until_last_swarm;
                     let f = (new_finds as f64) / ((mopt.pilot_time as f64) / (PERIOD_PILOT_COEF));
@@ -523,32 +492,36 @@ where
     }
 }
 
-impl<I, MT, S> StdMOptMutator<I, MT, S>
-where
-    MT: MutatorsTuple<I, S>,
-    S: HasRand + HasMetadata + HasCorpus + HasSolutions,
-{
+impl<MT> StdMOptMutator<MT> {
     /// Create a new [`StdMOptMutator`].
-    pub fn new(
+    pub fn new<S>(
         state: &mut S,
         mutations: MT,
-        max_stack_pow: u64,
+        max_stack_pow: usize,
         swarm_num: usize,
-    ) -> Result<Self, Error> {
+    ) -> Result<Self, Error>
+    where
+        S: HasMetadata + HasRand,
+        MT: NamedTuple,
+    {
         if !state.has_metadata::<MOpt>() {
             let rand_seed = state.rand_mut().next();
-            state.add_metadata::<MOpt>(MOpt::new(mutations.len(), swarm_num, rand_seed)?);
+            state.add_metadata::<MOpt>(MOpt::new(MT::LEN, swarm_num, rand_seed)?);
         }
+
         Ok(Self {
-            name: format!("StdMOptMutator[{}]", mutations.names().join(",")),
+            name: Cow::from(format!("StdMOptMutator[{}]", mutations.names().join(","))),
             mode: MOptMode::Pilotfuzzing,
             finds_before: 0,
             mutations,
             max_stack_pow,
-            phantom: PhantomData,
         })
     }
-    fn core_mutate(&mut self, state: &mut S, input: &mut I) -> Result<MutationResult, Error> {
+    fn core_mutate<I, S>(&mut self, state: &mut S, input: &mut I) -> Result<MutationResult, Error>
+    where
+        S: HasMetadata + HasRand + HasSolutions + HasCorpus,
+        MT: MutatorsTuple<I, S>,
+    {
         let mut r = MutationResult::Skipped;
         let mopt = state.metadata_map_mut().get_mut::<MOpt>().unwrap();
         for i in 0..mopt.operator_num {
@@ -571,7 +544,11 @@ where
         Ok(r)
     }
 
-    fn pilot_mutate(&mut self, state: &mut S, input: &mut I) -> Result<MutationResult, Error> {
+    fn pilot_mutate<I, S>(&mut self, state: &mut S, input: &mut I) -> Result<MutationResult, Error>
+    where
+        S: HasMetadata + HasRand + HasSolutions + HasCorpus,
+        MT: MutatorsTuple<I, S>,
+    {
         let mut r = MutationResult::Skipped;
         let swarm_now;
         {
@@ -602,11 +579,9 @@ where
     }
 }
 
-impl<I, MT, S> ComposedByMutations<I, MT, S> for StdMOptMutator<I, MT, S>
-where
-    MT: MutatorsTuple<I, S>,
-    S: HasRand + HasMetadata + HasCorpus + HasSolutions,
-{
+impl<MT> ComposedByMutations for StdMOptMutator<MT> {
+    type Mutations = MT;
+
     /// Get the mutations
     #[inline]
     fn mutations(&self) -> &MT {
@@ -620,24 +595,20 @@ where
     }
 }
 
-impl<I, MT, S> Named for StdMOptMutator<I, MT, S>
-where
-    MT: MutatorsTuple<I, S>,
-    S: HasRand + HasMetadata + HasCorpus + HasSolutions,
-{
-    fn name(&self) -> &str {
+impl<MT> Named for StdMOptMutator<MT> {
+    fn name(&self) -> &Cow<'static, str> {
         &self.name
     }
 }
 
-impl<I, MT, S> ScheduledMutator<I, MT, S> for StdMOptMutator<I, MT, S>
+impl<I, MT, S> ScheduledMutator<I, S> for StdMOptMutator<MT>
 where
     MT: MutatorsTuple<I, S>,
     S: HasRand + HasMetadata + HasCorpus + HasSolutions,
 {
     /// Compute the number of iterations used to apply stacked mutations
     fn iterations(&self, state: &mut S, _: &I) -> u64 {
-        1 << (1 + state.rand_mut().below(self.max_stack_pow))
+        1 << (1 + state.rand_mut().zero_upto(self.max_stack_pow))
     }
 
     /// Get the next mutation to apply

@@ -15,10 +15,11 @@ use libafl::{
     inputs::{BytesInput, HasTargetBytes},
     monitors::MultiMonitor,
     mutators::{
-        scheduled::{havoc_mutations, tokens_mutations, StdScheduledMutator},
+        havoc_mutations::havoc_mutations,
+        scheduled::{tokens_mutations, StdScheduledMutator},
         token_mutations::{I2SRandReplace, Tokens},
     },
-    observers::{CanTrack, HitcountsMapObserver, TimeObserver},
+    observers::{CanTrack, HitcountsMapObserver, StdMapObserver, TimeObserver},
     schedulers::{IndexesLenTimeMinimizerScheduler, QueueScheduler},
     stages::{ShadowTracingStage, StdMutationalStage},
     state::{HasCorpus, StdState},
@@ -26,13 +27,14 @@ use libafl::{
 };
 use libafl_bolts::{
     core_affinity::Cores,
-    current_nanos,
+    nonzero,
+    ownedref::OwnedMutSlice,
     rands::StdRand,
     shmem::{ShMemProvider, StdShMemProvider},
-    tuples::{tuple_list, Merge},
+    tuples::{tuple_list, Handled, Merge},
     AsSlice,
 };
-use libafl_targets::{std_edges_map_observer, CmpLogObserver};
+use libafl_targets::{edges_map_mut_ptr, CmpLogObserver};
 use typed_builder::TypedBuilder;
 
 use crate::{CORPUS_CACHE_SIZE, DEFAULT_TIMEOUT_SECS};
@@ -72,6 +74,9 @@ where
     /// Bytes harness
     #[builder(setter(strip_option))]
     harness: Option<H>,
+    /// The map size used for the fuzzer
+    #[builder(default = 65536usize)]
+    map_size: usize,
     /// Fuzz `iterations` number of times, instead of indefinitely; implies use of `fuzz_loop_for`
     #[builder(default = None)]
     iterations: Option<u64>,
@@ -104,13 +109,12 @@ where
     }
 }
 
-#[allow(clippy::similar_names)]
-impl<'a, H> InMemoryBytesCoverageSugar<'a, H>
+impl<H> InMemoryBytesCoverageSugar<'_, H>
 where
     H: FnMut(&[u8]),
 {
     /// Run the fuzzer
-    #[allow(clippy::too_many_lines, clippy::similar_names)]
+    #[expect(clippy::too_many_lines)]
     pub fn run(&mut self) {
         let conf = match self.configuration.as_ref() {
             Some(name) => EventConfig::from_name(name),
@@ -138,16 +142,23 @@ where
 
         let monitor = MultiMonitor::new(|s| println!("{s}"));
 
+        // Create an observation channel to keep track of the execution time
+        let time_observer = TimeObserver::new("time");
+        let time_ref = time_observer.handle();
+
         let mut run_client = |state: Option<_>,
                               mut mgr: LlmpRestartingEventManager<_, _, _>,
                               _core_id| {
-            // Create an observation channel using the coverage map
-            let edges_observer =
-                HitcountsMapObserver::new(unsafe { std_edges_map_observer("edges") })
-                    .track_indices();
+            let time_observer = time_observer.clone();
 
-            // Create an observation channel to keep track of the execution time
-            let time_observer = TimeObserver::new("time");
+            // Create an observation channel using the coverage map
+            let edges_observer = HitcountsMapObserver::new(unsafe {
+                StdMapObserver::from_mut_slice(
+                    "edges",
+                    OwnedMutSlice::from_raw_parts_mut(edges_map_mut_ptr(), self.map_size),
+                )
+            })
+            .track_indices();
 
             let cmplog_observer = CmpLogObserver::new("cmplog", true);
 
@@ -157,7 +168,7 @@ where
                 // New maximization map feedback linked to the edges observer and the feedback state
                 MaxMapFeedback::new(&edges_observer),
                 // Time feedback, this one does not need a feedback state
-                TimeFeedback::with_observer(&time_observer)
+                TimeFeedback::new(&time_observer)
             );
 
             // A feedback to choose if an input is a solution or not
@@ -167,7 +178,7 @@ where
             let mut state = state.unwrap_or_else(|| {
                 StdState::new(
                     // RNG
-                    StdRand::with_seed(current_nanos()),
+                    StdRand::new(),
                     // Corpus that will be evolved, we keep a part in memory for performance
                     CachedOnDiskCorpus::new(out_dir.clone(), CORPUS_CACHE_SIZE).unwrap(),
                     // Corpus in which we store solutions (crashes in this example),
@@ -218,7 +229,7 @@ where
             if state.must_load_initial_inputs() {
                 if self.input_dirs.is_empty() {
                     // Generator of printable bytearrays of max size 32
-                    let mut generator = RandBytesGenerator::new(32);
+                    let mut generator = RandBytesGenerator::new(nonzero!(32));
 
                     // Generate 8 initial inputs
                     state
@@ -340,7 +351,8 @@ where
             .run_client(&mut run_client)
             .cores(self.cores)
             .broker_port(self.broker_port)
-            .remote_broker_addr(self.remote_broker_addr);
+            .remote_broker_addr(self.remote_broker_addr)
+            .time_ref(Some(time_ref));
         #[cfg(unix)]
         let launcher = launcher.stdout_file(Some("/dev/null"));
         match launcher.build().launch() {
@@ -380,7 +392,17 @@ pub mod pybind {
     impl InMemoryBytesCoverageSugar {
         /// Create a new [`InMemoryBytesCoverageSugar`]
         #[new]
-        #[allow(clippy::too_many_arguments)]
+        #[expect(clippy::too_many_arguments)]
+        #[pyo3(signature = (
+            input_dirs,
+            output_dir,
+            broker_port,
+            cores,
+            use_cmplog=None,
+            iterations=None,
+            tokens_file=None,
+            timeout=None
+        ))]
         fn new(
             input_dirs: Vec<PathBuf>,
             output_dir: PathBuf,
@@ -404,7 +426,7 @@ pub mod pybind {
         }
 
         /// Run the fuzzer
-        #[allow(clippy::needless_pass_by_value)]
+        #[expect(clippy::needless_pass_by_value)]
         pub fn run(&self, harness: PyObject) {
             inmemory::InMemoryBytesCoverageSugar::builder()
                 .input_dirs(&self.input_dirs)
@@ -429,7 +451,7 @@ pub mod pybind {
     }
 
     /// Register the module
-    pub fn register(_py: Python, m: &PyModule) -> PyResult<()> {
+    pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
         m.add_class::<InMemoryBytesCoverageSugar>()?;
         Ok(())
     }

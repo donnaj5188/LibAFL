@@ -3,6 +3,9 @@
 use alloc::boxed::Box;
 use core::any::type_name;
 
+#[cfg(feature = "nautilus")]
+pub mod nautilus;
+
 use libafl_bolts::{
     serdeany::{NamedSerdeAnyMap, SerdeAny, SerdeAnyMap},
     Error,
